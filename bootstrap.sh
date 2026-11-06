@@ -3,9 +3,15 @@
 # bootstrap.sh - Configuration initiale d'un serveur Debian / Ubuntu
 # Dépôt : https://github.com/bapt-git/Ubuntu-serv-setup
 #
-# Usage (en root, terminal interactif obligatoire) :
+# Usage (terminal interactif obligatoire) :
+#   curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/bootstrap.sh -o bootstrap.sh
+#   sudo bash bootstrap.sh
+#
+# Déjà en root (sudo -i) :
 #   curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/bootstrap.sh | bash
-#   ou : sudo bash bootstrap.sh
+#
+# NE PAS utiliser "curl ... | sudo bash" : sur Ubuntu 26.04 (sudo-rs) le script
+# est suspendu dès qu'il pose une question. Le script refuse ce mode.
 #
 # Détecte aussi les disques supplémentaires non montés (disque data des VM) et
 # propose de les monter, avec montage automatique au démarrage.
@@ -39,6 +45,9 @@ ADMIN_PASS=""
 SSH_KEYS=()
 EXISTING_KEYS=0
 FAILS=0
+EXEC_PHASE=0
+STEP_N=0
+STEP_TOTAL=0
 # Disques à monter (un index par montage)
 MOUNT_DEV=()      # disque (si formatage) ou partition existante
 MOUNT_POINT=()    # point de montage
@@ -51,7 +60,14 @@ info()    { printf '%s[INFO]%s  %s\n' "$C_BLUE" "$C_RESET" "$*"; }
 ok()      { printf '%s[ OK ]%s  %s\n' "$C_GREEN" "$C_RESET" "$*"; }
 warn()    { printf '%s[WARN]%s  %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
 die()     { printf '%s[ERR ]%s  %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
-section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+section() {
+  if (( EXEC_PHASE )); then
+    STEP_N=$((STEP_N + 1))
+    printf '\n%s== [%d/%d %s] %s ==%s\n' "$C_BOLD" "$STEP_N" "$STEP_TOTAL" "$(date +%T)" "$*" "$C_RESET"
+  else
+    printf '\n%s== %s ==%s\n' "$C_BOLD" "$*" "$C_RESET"
+  fi
+}
 trap 'die "Erreur ligne $LINENO (commande : $BASH_COMMAND)"' ERR
 
 # ----------------------------- Saisie (toujours via /dev/tty) ----------------
@@ -250,6 +266,15 @@ ask_disks() {
 # ----------------------------- Pré-requis ------------------------------------
 preflight() {
   [[ $EUID -eq 0 ]] || die "Ce script doit être lancé en root (ou via sudo)."
+  # "curl | sudo bash" : sudo relaie mal le terminal quand son entrée est un pipe
+  # (suspension du script à la 1re question sur Ubuntu 26.04 / sudo-rs)
+  if [[ ! -t 0 && "$(ps -o comm= -p "$PPID" 2>/dev/null | tr -d ' ')" == sudo* ]]; then
+    printf '%s\n' \
+      "Mode \"curl | sudo bash\" non supporté (le terminal se bloque). Utilise :" \
+      "  curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/bootstrap.sh -o bootstrap.sh" \
+      "  sudo bash bootstrap.sh" >&2
+    exit 1
+  fi
   { : </dev/tty; } 2>/dev/null || die "Aucun terminal interactif disponible : lance le script depuis une session SSH/console."
   [[ -r /etc/os-release ]] || die "/etc/os-release introuvable."
   # shellcheck disable=SC1091
@@ -722,6 +747,10 @@ main() {
   exec > >(tee -a "$LOG_FILE") 2>&1
   printf '\n===== bootstrap %s =====\n' "$(date '+%F %T')"
 
+  EXEC_PHASE=1
+  STEP_TOTAL=9
+  if (( ${#MOUNT_POINT[@]} > 0 )); then STEP_TOTAL=10; fi
+
   step_packages
   step_system
   step_disks
@@ -748,6 +777,11 @@ main() {
   echo "     ssh -p $SSH_PORT $ADMIN_USER@${ip:-<ip>}"
   if [[ "$SSH_PORT" != "22" ]]; then
     echo "     (pense à ouvrir le port $SSH_PORT dans le pare-feu de l'hébergeur)"
+  fi
+  if [[ -f /var/run/reboot-required ]]; then
+    echo
+    echo " ${C_YELLOW}Redémarrage requis${C_RESET} (noyau ou bibliothèques mis à jour) :"
+    echo "     sudo reboot   (après avoir testé la connexion SSH)"
   fi
   echo "=============================================================="
   if (( FAILS > 0 )); then exit 1; fi

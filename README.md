@@ -4,17 +4,25 @@ Script de configuration initiale d'un serveur **Debian / Ubuntu** (cloud ou VM),
 
 ## Lancement
 
-En root, depuis une session SSH ou console (terminal interactif obligatoire) :
+Terminal interactif obligatoire (session SSH ou console).
+
+Depuis le compte par défaut d'une image cloud (`ubuntu`, `debian`…) :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/bootstrap.sh -o bootstrap.sh
+sudo bash bootstrap.sh
+```
+
+Déjà en root (`sudo -i`) :
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/bootstrap.sh | bash
 ```
 
-Depuis le compte par défaut d'une image cloud (`ubuntu`, `debian`…) :
+> [!warning] Ne pas utiliser `curl … | sudo bash`
+> Sur Ubuntu 26.04 (`sudo-rs`), le script est suspendu dès la 2ᵉ question : `sudo` relaie mal le terminal quand son entrée est un pipe. Le script détecte ce cas et s'arrête avec la bonne commande.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/bootstrap.sh | sudo bash
-```
+Pendant l'exécution, chaque étape affiche sa progression et l'heure : `== [3/10 15:18:42] Disques ==`. Un redémarrage est signalé à la fin si une mise à jour l'exige.
 
 ## Déroulement
 
