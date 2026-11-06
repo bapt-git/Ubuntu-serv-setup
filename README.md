@@ -110,3 +110,24 @@ ssh -p <port> <admin>@<ip>
 ```
 
 En cas de changement de port SSH, l'ouvrir aussi dans le pare-feu de l'hébergeur.
+
+### Supprimer le compte fourni par l'image cloud
+
+Les images cloud créent un compte par défaut (`ubuntu`, `debian`…) avec **sudo sans mot de passe**. Le script ne le supprime pas : une fois la connexion avec le compte admin validée (et `sudo` testé), le supprimer depuis le compte admin :
+
+```bash
+sudo deluser --remove-home ubuntu
+sudo rm -f /etc/sudoers.d/90-cloud-init-users
+```
+
+### Vérifier quelle clé est utilisée
+
+Si plusieurs clés sont autorisées, retrouver celle d'une session :
+
+```bash
+echo $SSH_CLIENT                                   # 2e valeur = port source de la session
+sudo journalctl --since today | grep "Accepted publickey"   # port -> empreinte SHA256
+ssh-keygen -lf ~/.ssh/authorized_keys              # empreinte -> commentaire de la clé
+```
+
+Supprimer une clé inutile en restant connecté avec celle à garder, puis tester une nouvelle connexion avant de fermer la session.
