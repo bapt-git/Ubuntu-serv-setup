@@ -7,6 +7,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/bootstrap.sh | bash
 #   ou : sudo bash bootstrap.sh
 #
+# Détecte aussi les disques supplémentaires non montés (disque data des VM) et
+# propose de les monter, avec montage automatique au démarrage.
+#
 # Toutes les questions sont posées au début, un récapitulatif est affiché,
 # puis la configuration s'exécute sans interruption et se termine par une
 # vérification point par point.
@@ -36,6 +39,11 @@ ADMIN_PASS=""
 SSH_KEYS=()
 EXISTING_KEYS=0
 FAILS=0
+# Disques à monter (un index par montage)
+MOUNT_DEV=()      # disque (si formatage) ou partition existante
+MOUNT_POINT=()    # point de montage
+MOUNT_FORMAT=()   # 1 = disque vide à initialiser (GPT + ext4)
+MOUNT_UUID=()     # rempli à l'exécution
 
 # ----------------------------- Affichage -------------------------------------
 C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_BLUE=$'\e[34m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_RED=$'\e[31m'
@@ -109,6 +117,136 @@ add_key() { # ajoute une clé si son contenu n'est pas déjà présent
   SSH_KEYS+=("$k")
 }
 
+# ----------------------------- Disques ---------------------------------------
+readonly MIN_DISK_BYTES=$((1024 * 1024 * 1024))   # ignore < 1 Gio (lecteurs cloud-init, etc.)
+readonly MOUNTABLE_FS='^(ext2|ext3|ext4|xfs|btrfs)$'
+
+list_disks() { # disques physiques/virtuels (hors zram, loop, lecteurs optiques...)
+  lsblk -dnrpo NAME,TYPE | awk '$2 == "disk" && $1 !~ /^\/dev\/(zram|loop|ram|sr|fd)/ { print $1 }'
+}
+human_size() { lsblk -dno SIZE "$1" | tr -d ' '; }
+
+# Disque utilisé : quelque chose de monté (ou swap actif) dessus,
+# ou membre LVM / RAID / LUKS / ZFS -> à traiter à la main
+disk_is_busy() {
+  local d="$1"
+  if lsblk -nro MOUNTPOINT "$d" | grep -q .; then return 0; fi
+  if lsblk -nro TYPE "$d" | grep -qvE '^(disk|part)$'; then return 0; fi
+  if lsblk -nro FSTYPE "$d" | grep -qE 'LVM2_member|linux_raid_member|crypto_LUKS|swap|zfs_member'; then return 0; fi
+  return 1
+}
+
+# Disque vierge : ni partition, ni table de partitions, ni système de fichiers
+disk_is_empty() {
+  local d="$1"
+  [[ "$(lsblk -nrpo NAME "$d" | wc -l)" -eq 1 ]] || return 1
+  [[ -z "$(blkid -p -o value -s TYPE "$d" 2>/dev/null || true)" ]] || return 1
+  [[ -z "$(blkid -p -o value -s PTTYPE "$d" 2>/dev/null || true)" ]]
+}
+
+# Partitions (ou disque entier) portant un système de fichiers montable
+mountable_devs() {
+  local d="$1" dev fs
+  while IFS= read -r dev; do
+    fs="$(lsblk -ndo FSTYPE "$dev" 2>/dev/null | tr -d ' ' || true)"
+    if [[ "$fs" =~ $MOUNTABLE_FS ]]; then printf '%s\n' "$dev"; fi
+  done < <(lsblk -nrpo NAME "$d")
+}
+
+dev_desc() { # "ext4, 100G, label data"
+  local dev="$1" fs size label
+  fs="$(lsblk -ndo FSTYPE "$dev" | tr -d ' ')"
+  size="$(lsblk -ndo SIZE "$dev" | tr -d ' ')"
+  label="$(lsblk -ndo LABEL "$dev" 2>/dev/null || true)"
+  printf '%s, %s%s' "$fs" "$size" "${label:+, label $label}"
+}
+
+# Normalise et valide un point de montage. Affiche le chemin retenu, ou rien si refusé.
+check_mountpoint() {
+  local mp="$1" planned
+  [[ "$mp" == /* ]] || mp="/$mp"
+  mp="${mp%/}"
+  if [[ ! "$mp" =~ ^(/[A-Za-z0-9._-]+)+$ ]]; then
+    tty_print "  Chemin invalide (lettres, chiffres, . _ - et /)."; return 1
+  fi
+  case "$mp" in
+    /bin|/boot|/dev|/etc|/home|/lib|/lib32|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/snap|/srv|/sys|/tmp|/usr|/var \
+    |/bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib32/*|/lib64/*|/proc/*|/run/*|/sbin/*|/sys/*|/tmp/*|/usr/*)
+      tty_print "  $mp est un répertoire système, choisis un autre chemin (ex. /data, /srv/data, /var/lib/docker)."; return 1 ;;
+  esac
+  for planned in "${MOUNT_POINT[@]}"; do
+    if [[ "$planned" == "$mp" ]]; then tty_print "  $mp est déjà choisi pour un autre disque."; return 1; fi
+  done
+  if findmnt -n "$mp" >/dev/null 2>&1 || findmnt -sn "$mp" >/dev/null 2>&1; then
+    tty_print "  $mp est déjà monté ou déjà déclaré dans /etc/fstab."; return 1
+  fi
+  if [[ -e "$mp" ]]; then
+    if [[ ! -d "$mp" ]]; then tty_print "  $mp existe et n'est pas un dossier."; return 1; fi
+    if [[ -n "$(ls -A "$mp" 2>/dev/null || true)" ]]; then
+      tty_print "  $mp n'est pas vide : son contenu serait masqué par le montage."; return 1
+    fi
+  fi
+  printf '%s' "$mp"
+}
+
+next_default_mp() { # /data, puis /data2, /data3...
+  local n=1 mp="/data" planned taken
+  while true; do
+    taken=0
+    for planned in "${MOUNT_POINT[@]}"; do [[ "$planned" == "$mp" ]] && taken=1; done
+    if (( ! taken )) && ! findmnt -sn "$mp" >/dev/null 2>&1 && [[ ! -e "$mp" || -z "$(ls -A "$mp" 2>/dev/null || true)" ]]; then
+      printf '%s' "$mp"; return
+    fi
+    n=$((n + 1)); mp="/data$n"
+  done
+}
+
+ask_mountpoint() { # ask_mountpoint "Question" -> chemin validé
+  local reply mp
+  while true; do
+    reply="$(ask "$1" "$(next_default_mp)")"
+    if mp="$(check_mountpoint "$reply")" && [[ -n "$mp" ]]; then printf '%s' "$mp"; return; fi
+  done
+}
+
+plan_mount() { MOUNT_DEV+=("$1"); MOUNT_POINT+=("$2"); MOUNT_FORMAT+=("$3"); }
+
+ask_disks() {
+  local d size devs=() dev mp found=0
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    if (( $(lsblk -dnbo SIZE "$d") < MIN_DISK_BYTES )); then continue; fi
+    if [[ "$(lsblk -dno RO "$d" | tr -d ' ')" == "1" ]]; then continue; fi
+    if disk_is_busy "$d"; then continue; fi
+    found=1
+    size="$(human_size "$d")"
+
+    if disk_is_empty "$d"; then
+      tty_print "Disque non utilisé : $d ($size, vierge)"
+      if ask_yn "  Le formater (GPT + ext4) et le monter ?" "o"; then
+        mp="$(ask_mountpoint "  Point de montage")"
+        plan_mount "$d" "$mp" 1
+      fi
+      continue
+    fi
+
+    mapfile -t devs < <(mountable_devs "$d")
+    if (( ${#devs[@]} == 0 )); then
+      tty_print "Disque non utilisé : $d ($size) — contenu non reconnu, ignoré (à traiter manuellement)."
+      continue
+    fi
+    tty_print "Disque non utilisé : $d ($size) — contient déjà des données (aucun formatage ne sera fait)"
+    for dev in "${devs[@]}"; do
+      if ask_yn "  Monter $dev ($(dev_desc "$dev")) ?" "o"; then
+        mp="$(ask_mountpoint "  Point de montage pour $dev")"
+        plan_mount "$dev" "$mp" 0
+      fi
+    done
+  done < <(list_disks)
+
+  if (( ! found )); then tty_print "Aucun disque supplémentaire non monté détecté."; fi
+}
+
 # ----------------------------- Pré-requis ------------------------------------
 preflight() {
   [[ $EUID -eq 0 ]] || die "Ce script doit être lancé en root (ou via sudo)."
@@ -159,6 +297,9 @@ ask_questions() {
     if [[ -z "$NEW_HOSTNAME" || "$NEW_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then break; fi
     tty_print "  Nom invalide (lettres, chiffres et -, 63 caractères max, sans point)."
   done
+
+  # Disques supplémentaires
+  ask_disks
 
   # Sudo
   if ask_yn "Sudo sans mot de passe pour $ADMIN_USER ?" "n"; then PASSWORDLESS_SUDO=1; fi
@@ -240,6 +381,14 @@ ask_questions() {
   tty_print "  Port SSH          : $SSH_PORT"
   tty_print "  Durcissement SSH  : $yn_harden"
   tty_print "  Nom d'hôte        : ${NEW_HOSTNAME:-inchangé ($(hostname))}"
+  if (( ${#MOUNT_POINT[@]} == 0 )); then
+    tty_print "  Disques           : aucun montage"
+  else
+    local i
+    for i in "${!MOUNT_POINT[@]}"; do
+      tty_print "  Disque            : ${MOUNT_DEV[$i]} -> ${MOUNT_POINT[$i]} $( (( MOUNT_FORMAT[i] )) && echo '(FORMATAGE : GPT + ext4)' || echo '(données conservées)')"
+    done
+  fi
   tty_print "  Fuseau horaire    : $TIMEZONE"
   tty_print "  Paquets           : ${PACKAGES[*]}"
   ask_yn "Lancer la configuration ?" "o" || die "Annulé, rien n'a été modifié."
@@ -335,6 +484,53 @@ step_ssh_keys() {
   install -m 600 -o "$ADMIN_USER" -g "$group" "$tmp" "$ak"
   rm -f "$tmp"
   ok "$(grep -c . "$ak" || true) clé(s) dans $ak"
+}
+
+step_disks() {
+  (( ${#MOUNT_POINT[@]} > 0 )) || return 0
+  section "Disques"
+  local i dev mp part fs uuid label pass
+  [[ -f /etc/fstab.bak-bootstrap ]] || cp -a /etc/fstab /etc/fstab.bak-bootstrap
+
+  for i in "${!MOUNT_POINT[@]}"; do
+    dev="${MOUNT_DEV[$i]}"; mp="${MOUNT_POINT[$i]}"
+
+    if (( MOUNT_FORMAT[i] )); then
+      # Contrôle de sécurité : le disque doit toujours être vierge et inutilisé
+      disk_is_busy "$dev" && die "$dev est maintenant utilisé, formatage annulé."
+      disk_is_empty "$dev" || die "$dev n'est plus vierge, formatage annulé."
+      info "Partitionnement de $dev (GPT, une partition)..."
+      printf 'label: gpt\n,\n' | sfdisk -q "$dev"
+      part=""
+      for _ in $(seq 1 10); do
+        udevadm settle 2>/dev/null || true
+        part="$(lsblk -nrpo NAME,TYPE "$dev" | awk '$2 == "part" { print $1; exit }')"
+        [[ -n "$part" && -b "$part" ]] && break
+        sleep 1
+      done
+      [[ -n "$part" && -b "$part" ]] || die "Partition de $dev introuvable après partitionnement."
+      label="$(printf '%s' "$(basename "$mp")" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-16)"
+      info "Formatage de $part en ext4 (label $label)..."
+      mkfs.ext4 -q -m 1 -L "$label" "$part"
+      dev="$part"
+      MOUNT_DEV[i]="$part"
+    fi
+
+    uuid="$(blkid -s UUID -o value "$dev" || true)"
+    fs="$(blkid -s TYPE -o value "$dev" || true)"
+    [[ -n "$uuid" && -n "$fs" ]] || die "UUID ou type de système de fichiers introuvable pour $dev."
+    MOUNT_UUID[i]="$uuid"
+    pass=0; [[ "$fs" == ext* ]] && pass=2
+
+    mkdir -p "$mp"
+    # Retire une éventuelle ancienne ligne pour ce même système de fichiers
+    sed -i "\|^UUID=${uuid}[[:space:]]|d" /etc/fstab
+    # nofail : le serveur démarre même si le disque est absent
+    printf 'UUID=%s %s %s defaults,nofail,x-systemd.device-timeout=10s 0 %s\n' "$uuid" "$mp" "$fs" "$pass" >> /etc/fstab
+    systemctl daemon-reload
+    mount "$mp"
+    ok "$dev ($fs) monté sur $mp, montage automatique au démarrage."
+  done
 }
 
 step_firewall() {
@@ -505,6 +701,12 @@ verify() {
   check "Jail fail2ban sshd chargée"                 chk_f2b_jail
   check "Mises à jour automatiques"                  chk_autoupd
   check "Fuseau horaire $TIMEZONE"                   chk_timezone
+  local i
+  for i in "${!MOUNT_POINT[@]}"; do
+    check "Disque monté sur ${MOUNT_POINT[$i]}"      findmnt -n "${MOUNT_POINT[$i]}"
+    check "Montage ${MOUNT_POINT[$i]} dans fstab"    grep -qE "^UUID=${MOUNT_UUID[$i]:-none}[[:space:]]+${MOUNT_POINT[$i]}[[:space:]]" /etc/fstab
+  done
+
   if [[ -n "$NEW_HOSTNAME" ]]; then
     check "Nom d'hôte $NEW_HOSTNAME"                 chk_hostname
   fi
@@ -522,6 +724,7 @@ main() {
 
   step_packages
   step_system
+  step_disks
   step_user
   step_ssh_keys
   step_firewall      # avant SSH : le nouveau port est ouvert avant d'être utilisé

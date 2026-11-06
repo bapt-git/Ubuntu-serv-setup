@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/boo
 
 ## Déroulement
 
-1. **Questions** : compte admin, port SSH, nom d'hôte, sudo sans mot de passe, clés SSH, durcissement SSH, mot de passe
+1. **Questions** : compte admin, port SSH, nom d'hôte, disques supplémentaires, sudo sans mot de passe, clés SSH, durcissement SSH, mot de passe
 2. **Récapitulatif** et confirmation - rien n'est modifié avant
 3. **Exécution** sans interruption
 4. **Vérification** point par point (`[OK]` / `[KO]`)
@@ -39,6 +39,30 @@ curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/boo
 - Nom d'hôte (persistant malgré cloud-init), fuseau `Europe/Paris`
 - Mises à jour de sécurité automatiques
 - Log : `/var/log/bootstrap.log` (mots de passe jamais journalisés)
+
+## Disques supplémentaires
+
+Le script liste les disques **non utilisés** (rien de monté dessus, pas membre LVM/RAID/LUKS, plus de 1 Gio, hors zram/loop/lecteurs optiques) et propose de les monter :
+
+| État du disque | Action proposée |
+|---|---|
+| Vierge (ni partition ni système de fichiers) | GPT + une partition + **ext4**, puis montage |
+| Contient un système de fichiers (ext2/3/4, xfs, btrfs) | Montage **sans formatage**, données conservées |
+| Autre contenu (LVM inactif, NTFS, partitions sans FS…) | Ignoré, à traiter manuellement |
+
+- Point de montage demandé (défaut `/data`, puis `/data2`…), refusé s'il s'agit d'un dossier système, d'un dossier non vide ou d'un chemin déjà monté
+- Montage automatique via `/etc/fstab` par **UUID**, avec `nofail` : le serveur démarre même si le disque est absent
+- Juste avant le formatage, le script revérifie que le disque est toujours vierge
+- Sauvegarde : `/etc/fstab.bak-bootstrap`
+- Le point de montage appartient à root : `chown` à faire selon l'usage
+
+Agrandir plus tard un disque formaté par le script (après extension côté hyperviseur) :
+
+```bash
+sudo apt install cloud-guest-utils
+sudo growpart /dev/sdb 1
+sudo resize2fs /dev/sdb1
+```
 
 ## Durcissement SSH
 
@@ -63,6 +87,7 @@ Le mot de passe du compte reste utile pour `sudo` et la console de l'hébergeur.
 | `/etc/ssh/sshd_config` | Lignes `Port` commentées (sauvegarde : `sshd_config.bak-bootstrap`) |
 | `/etc/sudoers.d/90-bootstrap-<user>` | Sudo sans mot de passe (si choisi) |
 | `/etc/fail2ban/jail.d/10-bootstrap.local` | Jail fail2ban |
+| `/etc/fstab` | Montages des disques (sauvegarde : `fstab.bak-bootstrap`) |
 | `/etc/apt/apt.conf.d/20auto-upgrades` | Mises à jour automatiques |
 | `/etc/cloud/cloud.cfg.d/99-bootstrap-hostname.cfg` | Conservation du nom d'hôte |
 
