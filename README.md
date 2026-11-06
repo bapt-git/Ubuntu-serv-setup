@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/bapt-git/Ubuntu-serv-setup/main/boo
 ## Déroulement
 
 1. **Questions** : compte admin, port SSH, nom d'hôte, sudo sans mot de passe, clés SSH, durcissement SSH, mot de passe
-2. **Récapitulatif** et confirmation — rien n'est modifié avant
+2. **Récapitulatif** et confirmation - rien n'est modifié avant
 3. **Exécution** sans interruption
 4. **Vérification** point par point (`[OK]` / `[KO]`)
 
